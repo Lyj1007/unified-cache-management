@@ -657,7 +657,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
         self.load_tasks.clear()
-
+        num_local_layers = len(self.kv_caches)
         for request_id, request in metadata.request_meta.items():
             if len(request.load_block_ids[0]) == 0:
                 continue
@@ -670,8 +670,9 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids)
                 for layer_name in self.kv_caches:
                     layer_id = self.layer_name_to_id[layer_name]
+                    local_layer_id = layer_id % num_local_layers
                     shard_indexs = [layer_id] * len(ucm_block_ids)
-                    layer_ptrs = np.ascontiguousarray(total_ptrs[:, layer_id, :])
+                    layer_ptrs = np.ascontiguousarray(total_ptrs[:, local_layer_id, :])
                     task = self.store.load_data(ucm_block_ids, shard_indexs, layer_ptrs)
                     self.load_tasks[request_id][layer_name] = task
             except RuntimeError as e:
@@ -707,14 +708,16 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         metadata = self._get_connector_metadata()
 
         total_ucm_block_ids, total_vllm_block_ids = [], []
+        num_local_layers = len(self.kv_caches)
         layer_id = self.layer_name_to_id[layer_name]
+        local_layer_id = layer_id % num_local_layers
         for _, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
 
             self.is_save = True
             ucm_block_ids, vllm_block_ids = request.dump_block_ids
-            if self.tp_rank != 0 and layer_id == 0:
+            if self.tp_rank != 0 and local_layer_id == 0:
                 for i, ucm_block_id in enumerate(ucm_block_ids):
                     ucm_block_ids[i] = self.request_hasher(ucm_block_id)
             total_ucm_block_ids.extend(ucm_block_ids)
@@ -724,7 +727,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             total_ptrs = self.kv_cache_layout.extract_block_addrs(total_vllm_block_ids)
             shard_indexs = [layer_id] * len(total_ucm_block_ids)
             try:
-                layer_ptrs = np.ascontiguousarray(total_ptrs[:, layer_id, :])
+                layer_ptrs = np.ascontiguousarray(total_ptrs[:, local_layer_id, :])
                 self.synchronize()
                 task = self.store.dump_data(
                     total_ucm_block_ids, shard_indexs, layer_ptrs
