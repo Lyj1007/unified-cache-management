@@ -497,7 +497,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             num_loaded_request += 1
 
             ucm_block_ids, vllm_block_ids = request.load_block_ids
-            if self.tp_rank != 0 and not self.is_mla:
+            if self.tp_rank != 0:
                 for i, ucm_block_id in enumerate(ucm_block_ids):
                     ucm_block_ids[i] = self.request_hasher(ucm_block_id)
             total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids)
@@ -511,7 +511,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 self._invalid_block_ids.update(
                     metadata.request_meta[request_id].load_block_ids[1]
                 )
-                num_loaded_block -= len(request.load_block_ids[0])
 
         for request_id, task in request_to_task.items():
             try:
@@ -520,9 +519,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 logger.error(f"request {request_id} wait load task error. {e}")
                 self._invalid_block_ids.update(
                     metadata.request_meta[request_id].load_block_ids[1]
-                )
-                num_loaded_block -= len(
-                    metadata.request_meta[request_id].load_block_ids[0]
                 )
 
         load_end_time = time.perf_counter() * 1000
@@ -557,8 +553,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
     def wait_for_save(self) -> None:
         # TODO support PP
-        if self.is_mla and self.tp_rank != 0:
-            return
+        # if self.is_mla and self.tp_rank != 0:
+        #     return
 
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
@@ -595,7 +591,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 dump_tasks.append(task)
             except RuntimeError as e:
                 logger.error(f"dump kv cache failed. {e}")
-                return
 
             try:
                 for task in dump_tasks:
@@ -603,7 +598,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 save_end_time = time.perf_counter() * 1000
             except RuntimeError as e:
                 logger.error(f"wait for dump kv cache failed.{e}")
-                return
 
             save_speed = (
                 num_saved_block
@@ -663,15 +657,17 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 continue
 
             ucm_block_ids, vllm_block_ids = request.load_block_ids
-            if self.tp_rank != 0 and not self.is_mla:
+            if self.tp_rank != 0:
                 for i, ucm_block_id in enumerate(ucm_block_ids):
                     ucm_block_ids[i] = self.request_hasher(ucm_block_id)
             try:
                 total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids)
+                first_key = next(iter(self.kv_caches))
+                bias_layer_id = self.layer_name_to_id[first_key]
                 for layer_name in self.kv_caches:
                     layer_id = self.layer_name_to_id[layer_name]
                     shard_indexs = [layer_id] * len(ucm_block_ids)
-                    layer_ptrs = np.ascontiguousarray(total_ptrs[:, layer_id, :])
+                    layer_ptrs = np.ascontiguousarray(total_ptrs[:, layer_id-bias_layer_id, :])
                     task = self.store.load_data(ucm_block_ids, shard_indexs, layer_ptrs)
                     self.load_tasks[request_id][layer_name] = task
             except RuntimeError as e:
@@ -701,12 +697,14 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         **kwargs,
     ) -> None:
         # TODO support PP
-        if self.is_mla and self.tp_rank != 0:
-            return
+        # if self.is_mla and self.tp_rank != 0:
+        #     return
 
         metadata = self._get_connector_metadata()
 
         total_ucm_block_ids, total_vllm_block_ids = [], []
+        first_key = next(iter(self.kv_caches))
+        bias_layer_id = self.layer_name_to_id[first_key]
         layer_id = self.layer_name_to_id[layer_name]
         for _, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
@@ -724,7 +722,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             total_ptrs = self.kv_cache_layout.extract_block_addrs(total_vllm_block_ids)
             shard_indexs = [layer_id] * len(total_ucm_block_ids)
             try:
-                layer_ptrs = np.ascontiguousarray(total_ptrs[:, layer_id, :])
+                layer_ptrs = np.ascontiguousarray(total_ptrs[:, layer_id-bias_layer_id, :])
                 self.synchronize()
                 task = self.store.dump_data(
                     total_ucm_block_ids, shard_indexs, layer_ptrs
@@ -749,12 +747,13 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 class UCMCPConnector(UCMLayerWiseConnector):
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
         super().__init__(vllm_config, role)
+        # [k_task, k_task, ...] for mla
+        # [k_task, v_task/rope_task, k_task, vtask/rope_task, ...] for dsa or gqa
         self.use_layerwise = (
             self._vllm_config.kv_transfer_config.kv_connector_extra_config.get(
                 "use_layerwise", False
             )
         )
-
         try:
             from vllm.distributed import get_dcp_group, get_pcp_group
         except ImportError as e:
@@ -775,14 +774,11 @@ class UCMCPConnector(UCMLayerWiseConnector):
             self.dcp_rank = 0
             self.pcp_world_size = 1
             self.pcp_rank = 0
-        self.cp_world_size = (
-            self._vllm_config.parallel_config.prefill_context_parallel_size
-            * self._vllm_config.parallel_config.decode_context_parallel_size
-        )
+        self.cp_world_size = self.pcp_world_size * self.dcp_world_size
         self.current_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank
         old_tp_size = vllm_config.parallel_config.tensor_parallel_size
         logger.info(
-            f"pcp_world_size: {self.pcp_world_size}, pcp_rank: {self.pcp_rank}, dcp_world_size: {self.dcp_world_size}, dcp_rank: {self.dcp_rank}"
+            f"pcp_world_size: {self.pcp_world_size}, pcp_rank: {self.pcp_rank}, dcp_world_size: {self.dcp_world_size}, dcp_rank: {self.dcp_rank}, old_tp_size: {old_tp_size}"
         )
 
         self.tp_rank %= self.tp_size
@@ -798,119 +794,37 @@ class UCMCPConnector(UCMLayerWiseConnector):
         else:
             self.request_hasher = RequestHasher(vllm_config, self.tp_rank)
         vllm_config.parallel_config.tensor_parallel_size = old_tp_size
-        self.hash_block_size = self.block_size
-        self.block_size *= self.cp_world_size
         logger.info("Init UCMCPConnector.")
 
-    def get_num_new_matched_tokens(
-        self,
-        request: "Request",
-        num_computed_tokens: int,
-    ) -> tuple[int, bool]:
-        assert num_computed_tokens % self.block_size == 0
-        hbm_hit_block_num = num_computed_tokens // self.block_size
-
-        ucm_block_ids = self.generate_hash(
-            self.hash_block_size, request.all_token_ids, self._seed
-        )
-
-        external_block_ids = ucm_block_ids[hbm_hit_block_num * self.cp_world_size :]
-        if not external_block_ids:
-            return 0, False
-        try:
-            external_hit_blocks = self.store.lookup_on_prefix(external_block_ids) + 1
-            external_hit_blocks //= self.cp_world_size
-        except RuntimeError as e:
-            external_hit_blocks = 0
-            logger.error(f"request {request.request_id} look up error. {e}")
-        logger.info(
-            f"request_id: {request.request_id}, "
-            f"total_blocks_num: {len(ucm_block_ids)}, "
-            f"hit hbm: {hbm_hit_block_num * self.cp_world_size}, "
-            f"hit external: {external_hit_blocks * self.cp_world_size}"
-        )
-        if self.metrics_config:
-            ucmmetrics.update_stats(
-                {
-                    "interval_lookup_hit_rates": external_hit_blocks
-                    * self.cp_world_size
-                    / len(ucm_block_ids)
-                },
-            )
-
-        total_hit_block_num = hbm_hit_block_num + external_hit_blocks
-
-        external_hit_tokens = external_hit_blocks * self.block_size
-
-        # When all the tokens are cached in ssd or hbm,
-        # we need to recompute the last token. This if condition will be removed
-        # once vLLM scheduler provides a better solution in the future.
-        num_total_hit_tokens = total_hit_block_num * self.block_size
-        if num_total_hit_tokens == request.num_tokens:
-            external_hit_tokens -= 1
-
-        self.requests_meta[request.request_id] = RequestMeta(
-            ucm_block_ids=ucm_block_ids,
-            hbm_hit_block_num=hbm_hit_block_num,
-            total_hit_block_num=total_hit_block_num,
-            num_token_ids=len(request.all_token_ids),
-            token_processed=num_total_hit_tokens,
-        )
-
-        return external_hit_tokens, False
-
-    def _generate_dispatch_meta(
-        self,
-        req_meta: RequestMeta,
-        new_tokens: int,
-        vllm_block_ids: list[int],
-        need_load: bool = True,
-    ) -> RequestDispatchMeta:
-        # Since the block_size on the scheduler side is multiplied by cp_world_size,
-        # while the block_size on the UCM side remains unchanged,
-        # the selected ucm_blocks need to be expanded by a factor of cp_world_size.
-        hbm_hit_block_num = req_meta.hbm_hit_block_num
-        total_hit_block_num = req_meta.total_hit_block_num
-        ucm_block_ids = req_meta.ucm_block_ids
-        req_meta.vllm_block_ids.extend(vllm_block_ids)
-
-        load_ucm_block_ids, load_vllm_block_ids = [], []
-        dump_ucm_block_ids, dump_vllm_block_ids = [], []
-        if need_load:
-            load_ucm_block_ids = ucm_block_ids[
-                hbm_hit_block_num
-                * self.cp_world_size : total_hit_block_num
-                * self.cp_world_size
-            ]
-            load_vllm_block_ids = vllm_block_ids[hbm_hit_block_num:total_hit_block_num]
-
-        if req_meta.token_processed < req_meta.num_token_ids:
-            start_idx = req_meta.token_processed // self.block_size
-            end_idx = (req_meta.token_processed + new_tokens) // self.block_size
-            dump_ucm_block_ids = ucm_block_ids[
-                start_idx * self.cp_world_size : end_idx * self.cp_world_size
-            ]
-            dump_vllm_block_ids = req_meta.vllm_block_ids[start_idx:end_idx]
-            req_meta.token_processed += new_tokens
-
-        return RequestDispatchMeta(
-            (load_ucm_block_ids, load_vllm_block_ids),
-            (dump_ucm_block_ids, dump_vllm_block_ids),
-        )
-
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
-        # When DCP/PCP features are enabled,
-        # the blocks that each device can process are [current_rank :: cp_world_size],
-        # where current_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank.
+        """Set the connector metadata from the scheduler.
+
+        This function should be called by the model runner every time
+        before the model execution. The metadata will be used for runtime
+        KV cache loading and saving.
+
+        Args:
+            connector_metadata (dict): the connector metadata.
+        """
         for _, request in connector_metadata.request_meta.items():
             if len(request.load_block_ids[0]) > 0:
                 ucm_block_ids, vllm_block_ids = request.load_block_ids
-                ucm_block_ids = ucm_block_ids[self.current_rank :: self.cp_world_size]
+                if self.cp_world_size > 1:
+                    ucm_block_ids = ucm_block_ids[
+                        self.current_rank :: self.cp_world_size
+                    ]
+                current_loaded_block = len(ucm_block_ids)
+                vllm_block_ids = vllm_block_ids[:current_loaded_block]
                 request.load_block_ids = (ucm_block_ids, vllm_block_ids)
 
             if len(request.dump_block_ids[0]) > 0:
                 ucm_block_ids, vllm_block_ids = request.dump_block_ids
-                ucm_block_ids = ucm_block_ids[self.current_rank :: self.cp_world_size]
+                if self.cp_world_size > 1:
+                    ucm_block_ids = ucm_block_ids[
+                        self.current_rank :: self.cp_world_size
+                    ]
+                current_dumped_block = len(ucm_block_ids)
+                vllm_block_ids = vllm_block_ids[:current_dumped_block]
                 request.dump_block_ids = (ucm_block_ids, vllm_block_ids)
         super().bind_connector_metadata(connector_metadata)
 
@@ -1193,3 +1107,4 @@ class UCMConnector(KVConnectorBase_V1):
             Empty set if no load errors occurred.
         """
         return self.connector.get_block_ids_with_load_errors()
+    
