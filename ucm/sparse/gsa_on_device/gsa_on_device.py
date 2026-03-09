@@ -102,6 +102,7 @@ class GSAOnDevice(UcmSparseBase):
         super().__init__(vllm_config, role)
         self.rank = vllm_config.parallel_config.rank
         self.is_mla = vllm_config.model_config.is_deepseek_mla
+        self.gsa_enabled = False
 
         if vllm_config.device_config.device_type == "cuda":
             self.is_cuda = True
@@ -138,11 +139,20 @@ class GSAOnDevice(UcmSparseBase):
             self.gsa_on_device_config.vllm_hash_attention_skip_layers
         )
 
-        self.seq_len_threshhold = self.gsa_on_device_config.seq_len_threshhold
+        if self.is_cuda:
+            self.seq_len_threshold = self.gsa_on_device_config.gpu_seq_len_threshold
+            self.concurrency_threshold = (
+                self.gsa_on_device_config.gpu_concurrency_threshold
+            )
+        else:
+            self.seq_len_threshold = self.gsa_on_device_config.npu_seq_len_threshold
+            self.concurrency_threshold = (
+                self.gsa_on_device_config.npu_concurrency_threshold
+            )
+
         assert (
-            self.seq_len_threshhold
-            >= self.gsa_on_device_config.vllm_hash_attention_topk
-        ), "seq_len_threshhold must be larger than or equal to vllm_hash_attention_topk"
+            self.seq_len_threshold >= self.gsa_on_device_config.vllm_hash_attention_topk
+        ), "seq_len_threshold must be larger than or equal to vllm_hash_attention_topk"
         assert (
             self.gsa_on_device_config.vllm_hash_attention_topk % self.block_size == 0
         ), "vllm_hash_attention_topk must be divisible by block_size"
@@ -498,7 +508,7 @@ class GSAOnDevice(UcmSparseBase):
                         attn_metadata.seq_lens_device[
                             : attn_metadata.query_lens_device.numel()
                         ]
-                        >= self.seq_len_threshhold
+                        >= self.seq_len_threshold
                     )
                 self.topk_for_hamming = self.topk_for_hamming_full[
                     : self.batch_size_for_hamming
@@ -515,6 +525,7 @@ class GSAOnDevice(UcmSparseBase):
                 self.block_table_decode = self.ori_block_table_decode[
                     : self.batch_size_for_hamming
                 ]
+                self.new_block_tables = attn_metadata.block_tables
                 self.is_tensor_computed = True
 
         k_hash_compute = self.hash_encoder.compute_hash(key)
@@ -681,7 +692,7 @@ class GSAOnDevice(UcmSparseBase):
         self.topk_seq_lens = attn_metadata.seq_lens
 
     def update_decode_topk_gqa_npu(self, query, k_hash, attn_metadata):
-        q_start = attn_metadata.query_start_loc
+        q_start = attn_metadata.query_start_loc[: self.batch_size_for_hamming + 1]
         if self.slice_enabled:
             q_decode = query[: self.batch_size_for_hamming]
         else:
@@ -705,17 +716,12 @@ class GSAOnDevice(UcmSparseBase):
         )
         new_seq_lens = self.topk_seq_lens_qwen
         attn_metadata.seq_lens = new_seq_lens
-        if (
-            self.slice_enabled
-            and attn_metadata.attn_state != AscendAttentionState.DecodeOnly
-        ):
-            new_block_tables = attn_metadata.block_tables.clone()
-            new_block_tables[: self.batch_size_for_hamming] = self.hamming_output[
-                : self.batch_size_for_hamming, 0, :
-            ]
-        else:
-            new_block_tables = self.hamming_output[: self.batch_size_for_hamming, 0, :]
-        attn_metadata.block_tables = new_block_tables
+
+        self.new_block_tables[: self.batch_size_for_hamming] = self.hamming_output[
+            : self.batch_size_for_hamming, 0, :
+        ]
+
+        attn_metadata.block_tables = self.new_block_tables
         # topk for skip layer
         self.topk_block_table = attn_metadata.block_tables
         self.topk_seq_lens = attn_metadata.seq_lens
@@ -737,6 +743,10 @@ class GSAOnDevice(UcmSparseBase):
         # TODO: Should mark MTP layer as rollback layer
         is_rollback_layer, is_skip_hash_layer = self.get_layer_state(layer_name)
 
+        """
+        Cache key hashes even when GSA is disabled !
+        To avoid HBM-PC misses and prepare for future high concurrency.
+        """
         if not is_rollback_layer and not is_skip_hash_layer:
             if self.is_mla:
                 if self.is_cuda:
@@ -769,6 +779,10 @@ class GSAOnDevice(UcmSparseBase):
                     )
                 else:  # NPU
                     self.cache_k_hash_gqa_npu(key, k_hash, attn_metadata)
+
+        if not self.gsa_enabled:
+            return query, key, value, output
+
         if self.is_mla:
             if phase == "decode":
                 if self.is_cuda:
@@ -821,6 +835,8 @@ class GSAOnDevice(UcmSparseBase):
         forward_context: ForwardContext,
         phase: Optional[str] = None,
     ) -> None:
+        if not self.gsa_enabled:
+            return
         attn_metadata = self.get_layer_attn_metadata(forward_context, layer_name)
         if self.is_mla:
             if phase == "decode":
@@ -960,7 +976,7 @@ class GSAOnDevice(UcmSparseBase):
 
         # self.decode_mask is on cpu in vllm-asencd under NPU device
         self.decode_mask = (query_lens == 1) & (
-            seq_lens[: query_lens.numel()] >= self.seq_len_threshhold
+            seq_lens[: query_lens.numel()] >= self.seq_len_threshold
         )
         # self.decode_mask = self.decode_mask.pin_memory()
 
@@ -1024,13 +1040,62 @@ class GSAOnDevice(UcmSparseBase):
         else:
             return attn_metadata.block_tables[req_row_id]
 
+    def get_seq_lens(self, attn_metadata):
+        if not self.is_mla:
+            return getattr(attn_metadata, "seq_lens", None)
+
+        attn_metadata_decode = getattr(attn_metadata, "decode", None)
+        if attn_metadata_decode is not None:
+            return getattr(attn_metadata_decode, "seq_lens", None)
+
+        attn_metadata_prefill = getattr(attn_metadata, "prefill", None)
+        if attn_metadata_prefill is None:
+            return None
+
+        if self.is_cuda:
+            chunked = getattr(attn_metadata_prefill, "chunked_context", None)
+            if chunked is not None:
+                return getattr(chunked, "seq_lens", None)
+            # first-time prefill (non-chunked)
+            query_start_loc_prefill = getattr(
+                attn_metadata_prefill, "query_start_loc", None
+            )
+            if query_start_loc_prefill is not None:
+                return query_start_loc_prefill[1:] - query_start_loc_prefill[:-1]
+
+        return getattr(attn_metadata_prefill, "seq_lens", None)  # NPU
+
     def build_sparse_meta(
         self, scheduler_output, requests, input_batch, attn_metadata
     ) -> UcmSparseMetadata:
         from ucm.sparse.gsa_on_device.hamming_topk import update_seq_lens
 
+        self.num_reqs = len(scheduler_output.num_scheduled_tokens)
+
+        if isinstance(attn_metadata, dict):
+            attn_metadata = next(iter(attn_metadata.values()))
+
+        self.has_decode = False
+        self.gsa_enabled = False
+        seq_lens = self.get_seq_lens(attn_metadata)
+
+        if seq_lens is None:
+            return
+
+        """
+        Disable GSA in the following cases:
+        1. all seq_lens are below the seq_len_threshold.
+        2. Some seq_lens exceed the seq_len_threshold but concurrency is low.
+        """
+        num_long_reqs = int(
+            (seq_lens[: self.num_reqs] >= self.seq_len_threshold).sum().item()
+        )
+        self.gsa_enabled = num_long_reqs >= self.concurrency_threshold
+
+        if not self.gsa_enabled:
+            return
+
         if not self.is_mla:
-            self.has_decode = False
             self.decode_only = False
             self.has_pc_hit = False
 
@@ -1040,15 +1105,11 @@ class GSAOnDevice(UcmSparseBase):
             all_prefix_tokens = 0
             all_prefix_blocks = 0
 
-            if isinstance(attn_metadata, dict):
-                attn_metadata = next(iter(attn_metadata.values()))
-
             compute_q_lens = (
                 attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
             )
             self.decode_req_ids_buf.clear()
 
-            self.num_reqs = len(scheduler_output.num_scheduled_tokens)
             for (
                 req_id,
                 num_scheduled_tokens,
@@ -1068,7 +1129,7 @@ class GSAOnDevice(UcmSparseBase):
                 )
 
                 # when prompt length < topk_tokens Skip sparse!
-                if req.num_prompt_tokens < self.seq_len_threshhold:
+                if req.num_prompt_tokens < self.seq_len_threshold:
                     continue
 
                 if is_decode:
