@@ -220,7 +220,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
             # init scheduler-size connector
             self.store = self._create_store(None)
         else:
-            self.request_hasher = RequestHasher(vllm_config, self.tp_rank)
+            if self.is_mla:
+                self.request_hasher = RequestHasher(vllm_config, (self.tp_rank//self.tp_size)*self.tp_size)
+            else:
+                self.request_hasher = RequestHasher(vllm_config, self.tp_rank)
 
         self.metrics_config = self.launch_config.get("metrics_config_path", "")
         if self.metrics_config:
@@ -497,9 +500,11 @@ class UCMDirectConnector(KVConnectorBase_V1):
             num_loaded_request += 1
 
             ucm_block_ids, vllm_block_ids = request.load_block_ids
-            if self.tp_rank != 0 and not self.is_mla:
+
+            if self.tp_rank != 0:
                 for i, ucm_block_id in enumerate(ucm_block_ids):
                     ucm_block_ids[i] = self.request_hasher(ucm_block_id)
+                        
             total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids)
             total_ptrs = total_ptrs.reshape(total_ptrs.shape[0], -1)
             shard_indexs = [0] * len(ucm_block_ids)
@@ -567,7 +572,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
     def wait_for_save(self) -> None:
         # TODO support PP
-        if self.is_mla and self.tp_rank != 0:
+        if self.is_mla and self.tp_rank//self.tp_size != 0:
             return
 
         metadata = self._get_connector_metadata()
@@ -667,7 +672,6 @@ class UCMLayerWiseConnector(UCMDirectConnector):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
         self.load_tasks.clear()
-        num_local_layers = len(self.kv_caches)
         for request_id, request in metadata.request_meta.items():
             if len(request.load_block_ids[0]) == 0:
                 continue
@@ -680,7 +684,11 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 total_ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids)
                 for layer_name in self.kv_caches:
                     layer_id = self.layer_name_to_id[layer_name]
-                    local_layer_id = layer_id % num_local_layers
+
+                    first_key = next(iter(self.kv_caches))
+                    bias_layer_id = self.layer_name_to_id[first_key]
+                    local_layer_id = layer_id - bias_layer_id
+
                     shard_indexs = [layer_id] * len(ucm_block_ids)
                     layer_ptrs = np.ascontiguousarray(total_ptrs[:, local_layer_id, :])
                     task = self.store.load_data(ucm_block_ids, shard_indexs, layer_ptrs)
@@ -712,15 +720,18 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         **kwargs,
     ) -> None:
         # TODO support PP
-        if self.is_mla and self.tp_rank != 0:
+        if self.is_mla and self.tp_rank//self.tp_size != 0:
             return
 
         metadata = self._get_connector_metadata()
 
         total_ucm_block_ids, total_vllm_block_ids = [], []
-        num_local_layers = len(self.kv_caches)
         layer_id = self.layer_name_to_id[layer_name]
-        local_layer_id = layer_id % num_local_layers
+
+        first_key = next(iter(self.kv_caches))
+        bias_layer_id = self.layer_name_to_id[first_key]
+        local_layer_id = layer_id - bias_layer_id
+
         for _, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
@@ -812,7 +823,7 @@ class UCMCPConnector(UCMLayerWiseConnector):
             # init scheduler-size connector
             self.store = self._create_store(None)
         else:
-            self.request_hasher = RequestHasher(vllm_config, self.tp_rank)
+            self.request_hasher = RequestHasher(vllm_config, (self.tp_rank//self.tp_size)*self.tp_size)
         vllm_config.parallel_config.tensor_parallel_size = old_tp_size
         self.hash_block_size = self.block_size
         self.block_size *= self.cp_world_size
